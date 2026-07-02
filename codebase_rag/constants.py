@@ -185,6 +185,7 @@ KEY_EXPORTED_AT = "exported_at"
 KEY_PARSER = "parser"
 KEY_NAME = "name"
 KEY_QUALIFIED_NAME = "qualified_name"
+KEY_IS_PROPERTY = "is_property"
 KEY_QUERY = "query"
 KEY_RESPONSE = "response"
 KEY_START_LINE = "start_line"
@@ -389,6 +390,34 @@ DUP_QN_MARKER = "@"
 PATH_CURRENT_DIR = "."
 PATH_PARENT_DIR = ".."
 GLOB_ALL = "*"
+# (H) JS/TS import specifier schemes that name genuinely external code (node
+# (H) builtins, package registries, URLs). A specifier with any OTHER scheme
+# (H) (`ext:` deno-runtime aliases, bundler virtual modules) points at first-party
+# (H) code under a non-file-path name, so its unresolved calls defer to the trie.
+JS_EXTERNAL_IMPORT_SCHEMES: frozenset[str] = frozenset(
+    {"node", "npm", "jsr", "bun", "http", "https", "data", "file", "blob"}
+)
+# (H) Module file extensions stripped when turning a tsconfig `paths` target into a
+# (H) module qn (`src/util.ts` -> `src/util`), longest first so `.d.ts`-like
+# (H) compound suffixes are handled before the bare `.ts`.
+JS_TS_MODULE_EXTENSIONS: tuple[str, ...] = (
+    ".d.ts",
+    ".tsx",
+    ".ts",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".js",
+)
+TSCONFIG_FILENAMES: tuple[str, ...] = (
+    "tsconfig.json",
+    "tsconfig.base.json",
+    "jsconfig.json",
+)
+JS_INDEX_STEM = "index"
+TS_COMPILER_OPTIONS_KEY = "compilerOptions"
+TS_PATHS_KEY = "paths"
+TS_BASE_URL_KEY = "baseUrl"
 PATH_RELATIVE_PREFIX = "./"
 PATH_PARENT_PREFIX = "../"
 CPP_IMPORT_PARTITION_PREFIX = "import :"
@@ -417,7 +446,8 @@ class QueryFormat(StrEnum):
 
 
 # (H) Decorators whose presence marks a function/method as an implicit entry point
-# (H) (web routes, task/flow handlers, fixtures, CLI commands, event listeners).
+# (H) (web routes, task/flow handlers, fixtures, CLI commands, event listeners, and
+# (H) Pydantic validators/serializers the framework invokes by registration).
 DEFAULT_ROOT_DECORATORS: frozenset[str] = frozenset(
     {
         "route",
@@ -435,11 +465,30 @@ DEFAULT_ROOT_DECORATORS: frozenset[str] = frozenset(
         "app",
         "on_event",
         "listener",
+        "validator",
+        "field_validator",
+        "model_validator",
+        "root_validator",
+        "field_serializer",
+        "model_serializer",
     }
 )
 
-# (H) Substrings in a node's file path that mark it as test code.
-TEST_PATH_PATTERNS: tuple[str, ...] = ("test_", "_test", "conftest", "/tests/")
+# (H) Substrings in a node's file path that mark it as test code. Covers Python
+# (H) (test_, _test, conftest, /tests/), the JS/TS filename convention
+# (H) (foo.test.ts, foo.spec.tsx), and the Jest __tests__/ directory so those
+# (H) files are not reported as dead. Singular /test/ and /spec/ directories are
+# (H) intentionally excluded: they collide with product code (a domain "spec"
+# (H) module), which would misclassify live code as test.
+TEST_PATH_PATTERNS: tuple[str, ...] = (
+    "test_",
+    "_test",
+    "conftest",
+    "/tests/",
+    ".test.",
+    ".spec.",
+    "__tests__",
+)
 
 
 class NodeLabel(StrEnum):
@@ -1094,6 +1143,56 @@ CYPHER_ALL_MODULE_PATHS_INTERNAL = (
 CYPHER_ALL_FOLDER_PATHS = (
     "MATCH (f:Folder) RETURN f.path AS path, f.absolute_path AS absolute_path"
 )
+
+# (H) Rehydrate the in-memory function registry on an incremental run: returns
+# (H) every definition node's qualified name and label so call/instantiation
+# (H) resolution can see symbols defined in files that were not re-parsed.
+CYPHER_ALL_DEFINITION_QNS = (
+    "MATCH (n) WHERE n:Function OR n:Method OR n:Class OR n:Interface "
+    "OR n:Enum OR n:Type OR n:Union "
+    "RETURN n.qualified_name AS qualified_name, head(labels(n)) AS label, "
+    "n.is_property AS is_property"
+)
+
+# (H) Inbound reference edges (from unchanged files) into symbols defined in one
+# (H) of $paths. Captured BEFORE a changed file's subtree is deleted so the exact
+# (H) edges can be restored verbatim afterwards (issue #532, inbound half).
+# (H) Re-resolving the callers instead would diverge from a clean index, because
+# (H) cgr's call resolution is context-sensitive (protocol vs concrete receiver,
+# (H) import granularity); the original edges already match a clean re-index.
+CYPHER_INBOUND_EDGES = (
+    "MATCH (caller)-[r:CALLS|INSTANTIATES|IMPORTS|INHERITS|OVERRIDES]->(target) "
+    "WHERE target.path IN $paths AND caller.qualified_name IS NOT NULL "
+    "AND (caller.path IS NULL OR NOT caller.path IN $paths) "
+    "RETURN head(labels(caller)) AS caller_label, "
+    "caller.qualified_name AS caller_qn, type(r) AS rel, "
+    "head(labels(target)) AS target_label, target.qualified_name AS target_qn"
+)
+# (H) Rehydrate class_inheritance on an incremental run: every INHERITS edge
+# (H) (child -> base) with resolved qns, so protocol dispatch and inherited-method
+# (H) resolution still see the hierarchy of classes defined in files that were not
+# (H) re-parsed. Without it, editing a caller drops the protocol/inheritance
+# (H) redirect (issue #532 residual): a call resolves to the Protocol stub instead
+# (H) of the concrete implementer because _protocol_classes() is empty. Ordered by
+# (H) base_index so multiple-inheritance base order matches the original source,
+# (H) which method resolution and override attribution depend on.
+CYPHER_ALL_INHERITS = (
+    "MATCH (child)-[r:INHERITS]->(base) "
+    "WHERE child.qualified_name IS NOT NULL AND base.qualified_name IS NOT NULL "
+    "RETURN child.qualified_name AS child_qn, base.qualified_name AS base_qn, "
+    "r.base_index AS base_index "
+    "ORDER BY child_qn, base_index"
+)
+KEY_CHILD_QN = "child_qn"
+KEY_BASE_QN = "base_qn"
+KEY_BASE_INDEX = "base_index"
+
+CYPHER_PARAM_PATHS = "paths"
+KEY_CALLER_LABEL = "caller_label"
+KEY_CALLER_QN = "caller_qn"
+KEY_REL = "rel"
+KEY_TARGET_LABEL = "target_label"
+KEY_TARGET_QN = "target_qn"
 
 REALTIME_LOGGER_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
@@ -1764,6 +1863,18 @@ class CppNodeType(StrEnum):
     CONSTRUCTOR_OR_DESTRUCTOR_DECLARATION = "constructor_or_destructor_declaration"
     INLINE_METHOD_DEFINITION = "inline_method_definition"
     OPERATOR_CAST_DEFINITION = "operator_cast_definition"
+    TYPE_IDENTIFIER = "type_identifier"
+    PARAMETER_LIST = "parameter_list"
+    PARAMETER_DECLARATION = "parameter_declaration"
+    OPTIONAL_PARAMETER_DECLARATION = "optional_parameter_declaration"
+    INIT_DECLARATOR = "init_declarator"
+    TEMPLATE_TYPE = "template_type"
+    FIELD_EXPRESSION = "field_expression"
+    COMPOUND_STATEMENT = "compound_statement"
+    THIS = "this"
+    TYPE_DEFINITION = "type_definition"
+    ALIAS_DECLARATION = "alias_declaration"
+    TYPE_DESCRIPTOR = "type_descriptor"
 
 
 CPP_MODULE_EXTENSIONS = (".ixx", ".cppm", ".ccm", ".mxx")
@@ -1795,6 +1906,13 @@ CPP_EXPORT_PREFIXES = (
 CPP_KEYWORD_CLASS = "class"
 CPP_KEYWORD_STRUCT = "struct"
 CPP_EXPORTED_CLASS_KEYWORDS = frozenset({CPP_KEYWORD_CLASS, CPP_KEYWORD_STRUCT})
+
+# (H) A C/C++ class/struct/union tag with no body is a forward declaration
+# (H) (`class Widget;`); it must not become its own node, or it collides with the
+# (H) real definition's qn and fragments one class into several same-named nodes.
+CPP_TYPE_SPECIFIER_NODE_TYPES = frozenset(
+    {"class_specifier", "struct_specifier", "union_specifier"}
+)
 
 CPP_FALLBACK_OPERATOR = "operator_unknown"
 CPP_FALLBACK_DESTRUCTOR = "~destructor"
@@ -1916,6 +2034,10 @@ TS_VARIABLE_DECLARATOR = "variable_declarator"
 TS_CALL_EXPRESSION = "call_expression"
 TS_EXPORT_CLAUSE = "export_clause"
 TS_EXPORT_SPECIFIER = "export_specifier"
+TS_EXPORT_DEFAULT = "default"
+TS_ACCESSIBILITY_MODIFIER = "accessibility_modifier"
+TS_PRIVATE = "private"
+TS_PRIVATE_PROPERTY_IDENTIFIER = "private_property_identifier"
 
 # (H) Tree-sitter Java import node types
 TS_IMPORT_DECLARATION = "import_declaration"
@@ -1989,11 +2111,21 @@ TS_GO_TYPE_ALIAS = "type_alias"
 TS_GO_STRUCT_TYPE = "struct_type"
 TS_GO_INTERFACE_TYPE = "interface_type"
 TS_GO_PARAMETER_DECLARATION = "parameter_declaration"
+TS_GO_FUNC_LITERAL = "func_literal"
 TS_GO_SOURCE_FILE = "source_file"
 TS_GO_FUNCTION_DECLARATION = "function_declaration"
 TS_GO_METHOD_DECLARATION = "method_declaration"
 TS_GO_CALL_EXPRESSION = "call_expression"
 TS_GO_IMPORT_DECLARATION = "import_declaration"
+TS_GO_PARAMETER_LIST = "parameter_list"
+TS_GO_VAR_DECLARATION = "var_declaration"
+TS_GO_VAR_SPEC = "var_spec"
+TS_GO_SHORT_VAR_DECLARATION = "short_var_declaration"
+TS_GO_EXPRESSION_LIST = "expression_list"
+TS_GO_COMPOSITE_LITERAL = "composite_literal"
+TS_GO_UNARY_EXPRESSION = "unary_expression"
+TS_GO_POINTER_TYPE = "pointer_type"
+FIELD_OPERAND = "operand"
 
 # (H) Tree-sitter Scala node types
 TS_SCALA_CLASS_DEFINITION = "class_definition"
@@ -2036,6 +2168,7 @@ TS_PHP_OBJECT_CREATION_EXPRESSION = "object_creation_expression"
 TS_PHP_NAMESPACE_DEFINITION = "namespace_definition"
 TS_PHP_NAMESPACE_USE_DECLARATION = "namespace_use_declaration"
 TS_PHP_NAMESPACE_USE_CLAUSE = "namespace_use_clause"
+TS_PHP_FUNCTION = "function"
 TS_PHP_INCLUDE_EXPRESSION = "include_expression"
 TS_PHP_INCLUDE_ONCE_EXPRESSION = "include_once_expression"
 TS_PHP_REQUIRE_EXPRESSION = "require_expression"
@@ -2070,6 +2203,10 @@ TS_CPP_BINARY_EXPRESSION = "binary_expression"
 TS_CPP_UNARY_EXPRESSION = "unary_expression"
 TS_CPP_UPDATE_EXPRESSION = "update_expression"
 TS_CPP_FUNCTION_DECLARATOR = "function_declarator"
+# (H) Substring shared by C++ declarator node types (pointer_declarator,
+# (H) reference_declarator, parenthesized_declarator, ...), used to unwrap a
+# (H) parameter declarator down to its bound identifier.
+CPP_DECLARATOR_SUFFIX = "declarator"
 
 # (H) Tree-sitter Java node types for language_spec
 TS_JAVA_METHOD_INVOCATION = "method_invocation"
@@ -2085,6 +2222,7 @@ TS_CLASS_HERITAGE = "class_heritage"
 TS_IMPLEMENTS_CLAUSE = "implements_clause"
 TS_EXTENDS_CLAUSE = "extends_clause"
 TS_MEMBER_EXPRESSION = "member_expression"
+TS_SELECTOR_EXPRESSION = "selector_expression"
 TS_EXTENDS = "extends"
 TS_ARGUMENTS = "arguments"
 TS_EXTENDS_TYPE_CLAUSE = "extends_type_clause"
@@ -2103,6 +2241,16 @@ FIELD_OPERATOR = "operator"
 # (H) Derived node type tuples for class ingestion
 CPP_CLASS_TYPES = (CppNodeType.CLASS_SPECIFIER, TS_STRUCT_SPECIFIER)
 CPP_COMPOUND_TYPES = (*CPP_CLASS_TYPES, TS_UNION_SPECIFIER, TS_ENUM_SPECIFIER)
+# (H) Node types that open their own variable scope; C++ local-variable inference must
+# (H) not descend into them, or a name declared inside a lambda / nested function /
+# (H) local class body would be attributed to the enclosing function's scope.
+CPP_NESTED_SCOPE_NODE_TYPES = frozenset(
+    (
+        TS_CPP_FUNCTION_DEFINITION,
+        TS_CPP_LAMBDA_EXPRESSION,
+        *CPP_COMPOUND_TYPES,
+    )
+)
 JS_TS_PARENT_REF_TYPES = (TS_IDENTIFIER, TS_MEMBER_EXPRESSION)
 
 # (H) Import processor function names
@@ -2452,6 +2600,10 @@ TS_PY_TYPED_DEFAULT_PARAMETER = "typed_default_parameter"
 TS_PY_ATTRIBUTE = "attribute"
 TS_PY_CALL = "call"
 TS_PY_LIST = "list"
+TS_PY_DICTIONARY = "dictionary"
+TS_PY_PAIR = "pair"
+TS_PY_SET = "set"
+TS_PY_TUPLE = "tuple"
 TS_PY_LIST_COMPREHENSION = "list_comprehension"
 TS_PY_FOR_STATEMENT = "for_statement"
 TS_PY_FOR_IN_CLAUSE = "for_in_clause"
@@ -2461,6 +2613,7 @@ PY_RETURN_QUERY = "(return_statement) @return_stmt"
 TS_PY_CLASS_DEFINITION = "class_definition"
 TS_PY_BLOCK = "block"
 TS_PY_FUNCTION_DEFINITION = "function_definition"
+TS_PY_LAMBDA = "lambda"
 TS_PY_RETURN_STATEMENT = "return_statement"
 TS_PY_RETURN = "return"
 TS_PY_KEYWORD = "keyword"
@@ -2509,6 +2662,10 @@ PY_NONE = "None"
 # (H) Python keyword identifiers
 PY_KEYWORD_SELF = "self"
 PY_KEYWORD_CLS = "cls"
+# (H) Visibility by naming convention: a leading underscore marks a private
+# (H) symbol, while a dunder (__x__) is public API invoked by the runtime.
+PY_NAME_UNDERSCORE = "_"
+PY_NAME_DUNDER = "__"
 # (H) typing.Protocol base name and the conventional XxxProtocol class suffix
 # (H) used to map a Protocol to its concrete implementer.
 PY_PROTOCOL = "Protocol"
@@ -2550,8 +2707,13 @@ GUARD_INHERITED_METHOD = "_inherited_method_guard"
 # (H) JS/TS ingest node types
 TS_PAIR = "pair"
 TS_OBJECT = "object"
+TS_ARRAY = "array"
 TS_FUNCTION_EXPRESSION = "function_expression"
 TS_ARROW_FUNCTION = "arrow_function"
+TS_REQUIRED_PARAMETER = "required_parameter"
+TS_OPTIONAL_PARAMETER = "optional_parameter"
+TS_FIELD_PATTERN = "pattern"
+TS_FIELD_PARAMETER = "parameter"
 TS_MODULE = "module"
 TS_CLASS_BODY = "class_body"
 TS_STATIC = "static"

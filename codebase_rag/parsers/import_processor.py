@@ -1,3 +1,6 @@
+import json
+import posixpath
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -27,6 +30,89 @@ from .utils import (
     sorted_captures,
 )
 
+_JS_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9.+-]*):")
+_JSONC_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_JSONC_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_JSONC_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def _load_jsonc(path: Path) -> dict | None:
+    # (H) tsconfig.json is JSONC (comments, trailing commas). Try strict JSON first
+    # (H) (comment-free configs), then fall back to stripping comments/trailing
+    # (H) commas. The naive strip can mangle `//` inside string values, so it is only
+    # (H) a fallback; on any failure return None (aliases simply stay unresolved).
+    try:
+        text = path.read_text(encoding=cs.ENCODING_UTF8)
+    except OSError:
+        return None
+    for candidate in (text, None):
+        source = candidate
+        if source is None:
+            source = _JSONC_BLOCK_COMMENT_RE.sub("", text)
+            source = _JSONC_LINE_COMMENT_RE.sub("", source)
+            source = _JSONC_TRAILING_COMMA_RE.sub(r"\1", source)
+        try:
+            parsed = json.loads(source)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _load_ts_path_aliases(repo_path: Path) -> list[tuple[str, str, bool]]:
+    # (H) Parse tsconfig `compilerOptions.paths` into (match_prefix, target_prefix,
+    # (H) is_wildcard) tuples, folding baseUrl into the target. A `@/*`->`src/*` entry
+    # (H) yields ("@/", "src/", True); an exact `~lib`->`src/lib/index.ts` yields
+    # (H) ("~lib", "src/lib/index.ts", False). `extends` chains are not followed.
+    for name in cs.TSCONFIG_FILENAMES:
+        data = _load_jsonc(repo_path / name)
+        if not data:
+            continue
+        options = data.get(cs.TS_COMPILER_OPTIONS_KEY)
+        if not isinstance(options, dict):
+            continue
+        paths = options.get(cs.TS_PATHS_KEY)
+        if not isinstance(paths, dict):
+            continue
+        base = options.get(cs.TS_BASE_URL_KEY) or cs.PATH_CURRENT_DIR
+        base = str(base).strip(cs.SEPARATOR_SLASH)
+        base_prefix = (
+            "" if base in ("", cs.PATH_CURRENT_DIR) else base + cs.SEPARATOR_SLASH
+        )
+        aliases: list[tuple[str, str, bool]] = []
+        for pattern, targets in paths.items():
+            if not isinstance(targets, list) or not targets:
+                continue
+            target = targets[0]
+            if not isinstance(pattern, str) or not isinstance(target, str):
+                continue
+            if pattern.endswith(cs.GLOB_ALL) and cs.GLOB_ALL in target:
+                aliases.append(
+                    (
+                        pattern[: -len(cs.GLOB_ALL)],
+                        base_prefix + target[: target.index(cs.GLOB_ALL)],
+                        True,
+                    )
+                )
+            elif cs.GLOB_ALL not in pattern:
+                aliases.append((pattern, base_prefix + target, False))
+        return aliases
+    return []
+
+
+def _has_aliased_scheme(specifier: str) -> bool:
+    # (H) True for a JS/TS specifier with a non-standard scheme (`ext:deno_node/x`),
+    # (H) which names first-party code under a non-file-path alias. Standard external
+    # (H) schemes (node:/npm:/jsr:/http(s):) and bare/scoped package names
+    # (H) (`lodash`, `@scope/pkg`) are NOT aliased -> they stay externally suppressed.
+    # (H) A tsconfig `paths` alias (`@/util`) has no scheme and is not exempted here
+    # (H) (it would be indistinguishable from a scoped package `@scope/pkg`); it is
+    # (H) instead resolved PRECISELY to its real module upstream by
+    # (H) _resolve_js_module_path via _load_ts_path_aliases, so no trie fallback is
+    # (H) needed for it.
+    match = _JS_SCHEME_RE.match(specifier)
+    return bool(match) and match.group(1).lower() not in cs.JS_EXTERNAL_IMPORT_SCHEMES
+
 
 class ImportProcessor:
     __slots__ = (
@@ -35,6 +121,9 @@ class ImportProcessor:
         "ingestor",
         "function_registry",
         "import_mapping",
+        "php_function_imports",
+        "js_ts_bare_imports",
+        "js_path_aliases",
         "stdlib_extractor",
         "_is_local_module_cached",
         "_is_local_java_import_cached",
@@ -52,6 +141,27 @@ class ImportProcessor:
         self.ingestor = ingestor
         self.function_registry = function_registry
         self.import_mapping: dict[str, dict[str, str]] = {}
+        # (H) Local names brought in by a PHP `use function A\B\c` import, keyed by
+        # (H) module. A PHP namespace path never matches cgr's file-path qualified
+        # (H) name (a global helper declares `namespace Illuminate\Support` from
+        # (H) Collections/functions.php), so these must resolve by simple name via
+        # (H) the trie rather than being judged external-import and suppressed.
+        self.php_function_imports: dict[str, set[str]] = {}
+        # (H) Local names brought in by a JS/TS import with a NON-STANDARD scheme
+        # (H) (`ext:deno_node/y`; see _has_aliased_scheme), keyed by module. Such a
+        # (H) specifier aliases first-party code but does not resolve to a file-path
+        # (H) module qn, so the target is unregistered and would be judged external,
+        # (H) dropping the call. These names defer to the simple-name trie (like a
+        # (H) relative import that misses) instead of being suppressed. Ordinary
+        # (H) package specifiers (bare, scoped, node:/npm:) are excluded, so genuine
+        # (H) external calls stay suppressed.
+        self.js_ts_bare_imports: dict[str, set[str]] = {}
+        # (H) tsconfig `paths` aliases (match_prefix, target_prefix, is_wildcard),
+        # (H) parsed once from the repo-root tsconfig so `@/util` imports resolve to
+        # (H) the real first-party module instead of being dropped as external.
+        self.js_path_aliases: list[tuple[str, str, bool]] = _load_ts_path_aliases(
+            repo_path
+        )
         self.stdlib_extractor = StdlibExtractor(
             function_registry, repo_path, project_name
         )
@@ -116,6 +226,10 @@ class ImportProcessor:
         lang_config = queries[language]["config"]
 
         self.import_mapping[module_qn] = {}
+        # (H) Reset per-module PHP use-function state too, so a re-index that drops a
+        # (H) `use function` import does not leave a stale exemption behind.
+        self.php_function_imports.pop(module_qn, None)
+        self.js_ts_bare_imports.pop(module_qn, None)
 
         try:
             if pre_captures is not None:
@@ -461,9 +575,11 @@ class ImportProcessor:
         for import_node in captures.get(cs.CAPTURE_IMPORT, []):
             if import_node.type == cs.TS_IMPORT_STATEMENT:
                 source_module = None
+                is_aliased_scheme = False
                 for child in import_node.children:
                     if child.type == cs.TS_STRING:
                         source_text = safe_decode_with_fallback(child).strip("'\"")
+                        is_aliased_scheme = _has_aliased_scheme(source_text)
                         source_module = self._resolve_js_module_path(
                             source_text, module_qn
                         )
@@ -474,7 +590,9 @@ class ImportProcessor:
 
                 for child in import_node.children:
                     if child.type == cs.TS_IMPORT_CLAUSE:
-                        self._parse_js_import_clause(child, source_module, module_qn)
+                        self._parse_js_import_clause(
+                            child, source_module, module_qn, is_aliased_scheme
+                        )
 
             elif import_node.type == cs.TS_LEXICAL_DECLARATION:
                 self._parse_js_require(import_node, module_qn)
@@ -482,8 +600,59 @@ class ImportProcessor:
             elif import_node.type == cs.TS_EXPORT_STATEMENT:
                 self._parse_js_reexport(import_node, module_qn)
 
+    def _ts_alias_module_qn(self, import_path: str) -> str | None:
+        # (H) Resolve a tsconfig `paths` alias (`@/util` -> `src/util`) to the
+        # (H) first-party module qn, so the call binds to the real file instead of
+        # (H) being dropped as external. Precise (maps to the actual path), so no
+        # (H) trie-fallback collision risk. Longest matching prefix wins.
+        best: tuple[int, str] | None = None
+        for prefix, target_prefix, is_wildcard in self.js_path_aliases:
+            if is_wildcard:
+                if import_path.startswith(prefix) and len(prefix) > (
+                    best[0] if best else -1
+                ):
+                    best = (len(prefix), target_prefix + import_path[len(prefix) :])
+            elif import_path == prefix and len(prefix) > (best[0] if best else -1):
+                best = (len(prefix), target_prefix)
+        if best is None:
+            return None
+        path = best[1]
+        for ext in cs.JS_TS_MODULE_EXTENSIONS:
+            if path.endswith(ext):
+                path = path[: -len(ext)]
+                break
+        # (H) normpath collapses `.`/`..` so the qn is clean and an escaping alias
+        # (H) (`../x`) is rejected below.
+        normalized = posixpath.normpath(path)
+        if normalized in (cs.PATH_CURRENT_DIR, "") or normalized.startswith(
+            cs.PATH_PARENT_DIR
+        ):
+            return None
+        # (H) Only accept the alias when it maps to a real first-party file on disk.
+        # (H) A broad/catch-all alias (`"*": ["src/*"]`) would otherwise capture bare
+        # (H) package imports (`lodash` -> `proj.src.lodash`) and let their calls
+        # (H) rebind to same-named first-party symbols (the #580 collision). A missing
+        # (H) target falls through to the normal external handling.
+        module_rel: str | None = None
+        if any(
+            (self.repo_path / f"{normalized}{ext}").is_file()
+            for ext in cs.JS_TS_MODULE_EXTENSIONS
+        ):
+            module_rel = normalized
+        elif (self.repo_path / normalized).is_dir() and any(
+            (self.repo_path / normalized / f"{cs.JS_INDEX_STEM}{ext}").is_file()
+            for ext in cs.JS_TS_MODULE_EXTENSIONS
+        ):
+            module_rel = f"{normalized}{cs.SEPARATOR_SLASH}{cs.JS_INDEX_STEM}"
+        if module_rel is None:
+            return None
+        dotted = module_rel.replace(cs.SEPARATOR_SLASH, cs.SEPARATOR_DOT)
+        return f"{self.project_name}{cs.SEPARATOR_DOT}{dotted}"
+
     def _resolve_js_module_path(self, import_path: str, current_module: str) -> str:
         if not import_path.startswith(cs.PATH_CURRENT_DIR):
+            if aliased := self._ts_alias_module_qn(import_path):
+                return aliased
             return import_path.replace(cs.SEPARATOR_SLASH, cs.SEPARATOR_DOT)
 
         current_parts = current_module.split(cs.SEPARATOR_DOT)[:-1]
@@ -501,14 +670,25 @@ class ImportProcessor:
         return cs.SEPARATOR_DOT.join(current_parts)
 
     def _parse_js_import_clause(
-        self, clause_node: Node, source_module: str, current_module: str
+        self,
+        clause_node: Node,
+        source_module: str,
+        current_module: str,
+        is_aliased_scheme: bool = False,
     ) -> None:
+        def _note_bare(local_name: str) -> None:
+            if is_aliased_scheme:
+                self.js_ts_bare_imports.setdefault(current_module, set()).add(
+                    local_name
+                )
+
         for child in clause_node.children:
             if child.type == cs.TS_IDENTIFIER:
                 imported_name = safe_decode_with_fallback(child)
                 self.import_mapping[current_module][imported_name] = (
                     f"{source_module}{cs.IMPORT_DEFAULT_SUFFIX}"
                 )
+                _note_bare(imported_name)
                 logger.debug(
                     ls.IMP_JS_DEFAULT, name=imported_name, module=source_module
                 )
@@ -528,6 +708,7 @@ class ImportProcessor:
                             self.import_mapping[current_module][local_name] = (
                                 f"{source_module}{cs.SEPARATOR_DOT}{imported_name}"
                             )
+                            _note_bare(local_name)
                             logger.debug(
                                 ls.IMP_JS_NAMED,
                                 local=local_name,
@@ -854,6 +1035,9 @@ class ImportProcessor:
                 self._handle_php_include_require(import_node, module_qn)
 
     def _handle_php_use_declaration(self, use_node: Node, module_qn: str) -> None:
+        # (H) `use function A\B\c` / `use const A\B\C` carry the modifier either on the
+        # (H) declaration (older grammar) or inside each clause (current grammar).
+        decl_is_function = any(c.type == cs.TS_PHP_FUNCTION for c in use_node.children)
         for child in use_node.named_children:
             if child.type != cs.TS_PHP_NAMESPACE_USE_CLAUSE:
                 continue
@@ -874,6 +1058,10 @@ class ImportProcessor:
                 parts = imported_path.split(cs.SEPARATOR_DOT)
                 local_name = parts[-1] if parts else imported_path
             self.import_mapping[module_qn][local_name] = imported_path
+            if decl_is_function or any(
+                c.type == cs.TS_PHP_FUNCTION for c in child.children
+            ):
+                self.php_function_imports.setdefault(module_qn, set()).add(local_name)
 
     def _handle_php_include_require(self, node: Node, module_qn: str) -> None:
         for child in node.children:

@@ -8,6 +8,8 @@ from ..types_defs import (
     LanguageQueries,
     SimpleNameLookup,
 )
+from .cpp import CppTypeInferenceEngine
+from .go import GoTypeInferenceEngine
 from .import_processor import ImportProcessor
 from .java import JavaTypeInferenceEngine
 from .js_ts import JsTypeInferenceEngine
@@ -29,10 +31,13 @@ class TypeInferenceEngine:
         "module_qn_to_file_path",
         "class_inheritance",
         "simple_name_lookup",
+        "class_field_types",
         "_java_type_inference",
         "_lua_type_inference",
         "_js_type_inference",
         "_python_type_inference",
+        "_go_type_inference",
+        "_cpp_type_inference",
     )
 
     def __init__(
@@ -46,6 +51,7 @@ class TypeInferenceEngine:
         module_qn_to_file_path: dict[str, Path],
         class_inheritance: dict[str, list[str]],
         simple_name_lookup: SimpleNameLookup,
+        class_field_types: dict[str, dict[str, str]] | None = None,
     ):
         self.import_processor = import_processor
         self.function_registry = function_registry
@@ -56,11 +62,32 @@ class TypeInferenceEngine:
         self.module_qn_to_file_path = module_qn_to_file_path
         self.class_inheritance = class_inheritance
         self.simple_name_lookup = simple_name_lookup
+        # (H) Must preserve the shared dict reference: the factory passes the
+        # (H) DefinitionProcessor's map, which is empty at construction and populated
+        # (H) later during ingestion. `or {}` would swap an empty dict for a new one and
+        # (H) silently lose every field type written afterward.
+        self.class_field_types = (
+            class_field_types if class_field_types is not None else {}
+        )
 
         self._java_type_inference: JavaTypeInferenceEngine | None = None
         self._lua_type_inference: LuaTypeInferenceEngine | None = None
         self._js_type_inference: JsTypeInferenceEngine | None = None
         self._python_type_inference: PythonTypeInferenceEngine | None = None
+        self._go_type_inference: GoTypeInferenceEngine | None = None
+        self._cpp_type_inference: CppTypeInferenceEngine | None = None
+
+    @property
+    def go_type_inference(self) -> GoTypeInferenceEngine:
+        if self._go_type_inference is None:
+            self._go_type_inference = GoTypeInferenceEngine()
+        return self._go_type_inference
+
+    @property
+    def cpp_type_inference(self) -> CppTypeInferenceEngine:
+        if self._cpp_type_inference is None:
+            self._cpp_type_inference = CppTypeInferenceEngine()
+        return self._cpp_type_inference
 
     @property
     def java_type_inference(self) -> JavaTypeInferenceEngine:
@@ -118,6 +145,41 @@ class TypeInferenceEngine:
         return self._python_type_inference
 
     def build_local_variable_type_map(
+        self,
+        caller_node: ASTNode,
+        module_qn: str,
+        language: cs.SupportedLanguage,
+        class_context: str | None = None,
+    ) -> dict[str, str]:
+        local = self._build_local_variable_type_map(caller_node, module_qn, language)
+        # (H) When the caller is a method, overlay its class's member-field types as a
+        # (H) base so a bare `field_.method()` receiver resolves; parameters and locals
+        # (H) with the same name shadow a field, so the local map wins on conflict.
+        if class_context and (fields := self._collect_field_types(class_context)):
+            return {**fields, **local}
+        return local
+
+    def _collect_field_types(self, class_qn: str) -> dict[str, str]:
+        # (H) Collect member-field types along the inheritance chain so a derived class
+        # (H) method can resolve a field inherited from a base. Bases are visited first
+        # (H) and the class's own fields applied last, so a derived field shadows a
+        # (H) base field of the same name. Guards against inheritance cycles.
+        fields: dict[str, str] = {}
+        seen: set[str] = set()
+
+        def collect(qn: str) -> None:
+            if qn in seen:
+                return
+            seen.add(qn)
+            for base in self.class_inheritance.get(qn, []):
+                collect(base)
+            if own := self.class_field_types.get(qn):
+                fields.update(own)
+
+        collect(class_qn)
+        return fields
+
+    def _build_local_variable_type_map(
         self, caller_node: ASTNode, module_qn: str, language: cs.SupportedLanguage
     ) -> dict[str, str]:
         match language:
@@ -135,6 +197,14 @@ class TypeInferenceEngine:
                 )
             case cs.SupportedLanguage.LUA:
                 return self.lua_type_inference.build_local_variable_type_map(
+                    caller_node, module_qn
+                )
+            case cs.SupportedLanguage.GO:
+                return self.go_type_inference.build_local_variable_type_map(
+                    caller_node, module_qn
+                )
+            case cs.SupportedLanguage.CPP:
+                return self.cpp_type_inference.build_local_variable_type_map(
                     caller_node, module_qn
                 )
             case _:

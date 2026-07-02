@@ -25,6 +25,7 @@ class CallResolver:
         "import_processor",
         "type_inference",
         "class_inheritance",
+        "type_aliases",
         "_simple_resolution_cache",
         "_wildcard_cache",
         "_protocol_impl_cache",
@@ -41,11 +42,15 @@ class CallResolver:
         import_processor: ImportProcessor,
         type_inference: TypeInferenceEngine,
         class_inheritance: dict[str, list[str]],
+        type_aliases: dict[str, str] | None = None,
     ) -> None:
         self.function_registry = function_registry
         self.import_processor = import_processor
         self.type_inference = type_inference
         self.class_inheritance = class_inheritance
+        # (H) C++ typedef/using alias -> underlying bare type, consulted when a
+        # (H) receiver type name is mapped to a class (empty for other languages).
+        self.type_aliases = type_aliases if type_aliases is not None else {}
         self._simple_resolution_cache: dict[
             tuple[str, str], tuple[str, str] | None
         ] = {}
@@ -265,10 +270,124 @@ class CallResolver:
         ):
             return result
 
+        # (H) A bare name explicitly imported from outside the project binds to that
+        # (H) external symbol. Since precise import / same-module resolution above
+        # (H) already failed, the symbol is unindexed; do NOT let the simple-name
+        # (H) trie fallback rebind it to an unrelated first-party symbol of the same
+        # (H) name. (The instantiation eval caught `from evals import GraphData;
+        # (H) GraphData()` being resolved to codebase_rag's own GraphData class.)
+        if cs.SEPARATOR_DOT not in call_name and self._is_external_import(
+            call_name, module_qn
+        ):
+            if use_cache:
+                self._simple_resolution_cache[cache_key] = None
+            return None
+
+        # (H) A member call `obj.method` whose receiver has a KNOWN inferred type that is
+        # (H) not a first-party class is a call on an external object (e.g. a
+        # (H) `std::string`). Precise local-type resolution above already failed, so the
+        # (H) method lives on the external type; do NOT let the simple-name trie fallback
+        # (H) rebind it to an unrelated first-party method of the same name. Untyped
+        # (H) receivers keep the fallback (their type is unknown, not known-external).
+        if self._receiver_type_is_external(call_name, module_qn, local_var_types):
+            if use_cache:
+                self._simple_resolution_cache[cache_key] = None
+            return None
+
         result = self._try_resolve_via_trie(call_name, module_qn)
         if use_cache:
             self._simple_resolution_cache[cache_key] = result
         return result
+
+    def _is_external_import(self, call_name: str, module_qn: str) -> bool:
+        # (H) True when call_name is imported in module_qn from a module outside the
+        # (H) project. First-party imports are written either project-prefixed
+        # (H) (`from proj.w import X`) or bare (`from utils.helpers import X`, where
+        # (H) the registered node is `proj.utils.helpers.X`); both are first-party
+        # (H) and left to the trie fallback. Only a target that is neither rooted at
+        # (H) the project nor registered under the project prefix is external, so
+        # (H) this suppresses cross-project fuzzy rebinds without dropping real
+        # (H) first-party calls.
+        import_map = self.import_processor.import_mapping.get(module_qn)
+        if not import_map:
+            return False
+        target = import_map.get(call_name)
+        if not target:
+            return False
+        # (H) A PHP `use function A\B\c` target is a namespace path, which never
+        # (H) matches cgr's file-path qualified name (a global helper declares
+        # (H) `namespace Illuminate\Support` from Collections/functions.php). Treating
+        # (H) it as external would suppress the simple-name trie fallback that a bare
+        # (H) PHP call already relies on, dropping the call; leave it to the trie.
+        # (H) LIMITATION: cgr qualifies PHP functions by file path and does not track
+        # (H) the `namespace` declaration anywhere, so a genuinely external
+        # (H) `use function Vendor\pkg\helper` cannot be told apart from a
+        # (H) path-mismatched first-party one; both defer to the trie, exactly as a
+        # (H) bare `helper()` call already does. Precise first-party-vs-external
+        # (H) disambiguation would require systemic PHP namespace tracking.
+        php_imports = self.import_processor.php_function_imports.get(module_qn)
+        if php_imports and call_name in php_imports:
+            return False
+        # (H) A JS/TS import with a non-standard scheme (deno `ext:deno_node/x`) does
+        # (H) not resolve to a file-path module qn, so its target is unregistered and
+        # (H) looks external even though it aliases first-party code. Defer to the
+        # (H) simple-name trie (like a relative import that misses) instead of
+        # (H) suppressing. Ordinary package specifiers (bare, scoped, node:/npm:) are
+        # (H) NOT recorded here, so genuine external calls stay suppressed.
+        bare_imports = self.import_processor.js_ts_bare_imports.get(module_qn)
+        if bare_imports and call_name in bare_imports:
+            return False
+        # (H) Only dotted absolute-path imports (Python/Java `pkg.mod.Name`) are
+        # (H) judged here. Rust/C++ record relative or `::`-separated targets
+        # (H) (`super::b::helper`) that never carry the project prefix and rely on
+        # (H) the trie fallback to resolve, so they must not be mistaken external.
+        if cs.SEPARATOR_DOT not in target or cs.SEPARATOR_DOUBLE_COLON in target:
+            return False
+        project_root = module_qn.split(cs.SEPARATOR_DOT, 1)[0]
+        if target.split(cs.SEPARATOR_DOT, 1)[0] == project_root:
+            return False
+        return f"{project_root}{cs.SEPARATOR_DOT}{target}" not in self.function_registry
+
+    def _receiver_type_is_external(
+        self,
+        call_name: str,
+        module_qn: str,
+        local_var_types: dict[str, str] | None,
+    ) -> bool:
+        # (H) True only for a two-part dotted member call `obj.method` whose `obj` has an
+        # (H) inferred local type that is known to be external. The receiver type is
+        # (H) external when it resolves to nothing, or to a qn that is neither registered
+        # (H) nor rooted at the project (a `std::string` -> `std.string`). In that case
+        # (H) the method lives on the external type, so the simple-name trie fallback must
+        # (H) not rebind it to a same-named first-party method. An untyped receiver (obj
+        # (H) absent from the map) or a project-rooted type is left alone: its method may
+        # (H) still be resolved by the fallback (e.g. a cross-file imported-class call the
+        # (H) precise path missed), so only a provably external type is suppressed.
+        if not local_var_types or cs.SEPARATOR_DOT not in call_name:
+            return False
+        parts = call_name.split(cs.SEPARATOR_DOT)
+        if len(parts) != 2:
+            return False
+        var_type = local_var_types.get(parts[0])
+        if var_type is None:
+            return False
+        import_map = self.import_processor.import_mapping.get(module_qn, {})
+        class_qn = self._resolve_class_qn_from_type(var_type, import_map, module_qn)
+        if not class_qn:
+            return True
+        # (H) First-party class qns may be written without the project prefix (a bare
+        # (H) `from models.user import User` resolves to `models.user.User` while the
+        # (H) registry stores `proj.models.user.User`), so check both the qn as-is and
+        # (H) the project-prefixed form before judging a type external -- mirrors
+        # (H) _is_external_import. A project-rooted qn is always treated as first-party.
+        project_root = module_qn.split(cs.SEPARATOR_DOT, 1)[0]
+        if class_qn.split(cs.SEPARATOR_DOT, 1)[0] == project_root:
+            return False
+        return (
+            class_qn not in self.function_registry
+            and f"{project_root}{cs.SEPARATOR_DOT}{class_qn}"
+            not in self.function_registry
+        )
 
     def _try_resolve_iife(
         self, call_name: str, module_qn: str
@@ -1051,9 +1170,23 @@ class CallResolver:
             base_distance -= 1
         return base_distance
 
+    def _dealias_type(self, type_name: str) -> str:
+        # (H) Follow C++ typedef/using aliases (`typedef Mutex MutexAlias;`) to the
+        # (H) underlying class name so an alias'd receiver resolves like the class it
+        # (H) names. Bounded against an alias cycle; a no-op when the name is not an
+        # (H) alias (and always, for languages with no aliases collected).
+        seen: set[str] = set()
+        while type_name in self.type_aliases and type_name not in seen:
+            seen.add(type_name)
+            type_name = self.type_aliases[type_name]
+        return type_name
+
     def _resolve_class_name(self, class_name: str, module_qn: str) -> str | None:
         return resolve_class_name(
-            class_name, module_qn, self.import_processor, self.function_registry
+            self._dealias_type(class_name),
+            module_qn,
+            self.import_processor,
+            self.function_registry,
         )
 
     def resolve_java_method_call(

@@ -437,6 +437,10 @@ class GraphUpdater:
             simple_name_lookup=self.simple_name_lookup
         )
         self.ast_cache = BoundedASTCache()
+        # (H) Every file parsed this run, in parse order. The AST cache is bounded
+        # (H) and evicts on large repos, so Pass 3 must iterate this full list (not
+        # (H) the cache) and re-parse evicted files, or their calls are dropped.
+        self._parsed_files: list[tuple[Path, cs.SupportedLanguage]] = []
         self.unignore_paths = unignore_paths
         self.exclude_paths = exclude_paths
         self.skipped_because_in_sync = False
@@ -498,6 +502,9 @@ class GraphUpdater:
             py_engine._return_stmt_cache.clear()
             py_engine._method_return_type_cache.clear()
             py_engine._self_assignment_cache.clear()
+        # (H) Reset per-run parse tracking so a reused updater does not reprocess
+        # (H) a previous run's files in Pass 3.
+        self._parsed_files.clear()
         self.ingestor.ensure_node_batch(
             cs.NODE_PROJECT, {cs.KEY_NAME: self.project_name}
         )
@@ -525,6 +532,22 @@ class GraphUpdater:
         if go_methods:
             logger.info("Resolved {} Go receiver methods", go_methods)
 
+        if not force:
+            self._rehydrate_registry_from_graph()
+
+        # (H) After rehydration so the "does a real definition exist?" check sees
+        # (H) definitions in files an incremental run did not re-parse; otherwise a
+        # (H) forward declaration whose definition lives in an unchanged file would be
+        # (H) kept as a phantom and re-fragment the class.
+        kept_forwards = (
+            self.factory.definition_processor.resolve_deferred_forward_declarations()
+        )
+        if kept_forwards:
+            logger.info(
+                "Registered {} forward-declared C/C++ types with no definition",
+                kept_forwards,
+            )
+
         logger.info(ls.FOUND_FUNCTIONS, count=len(self.function_registry))
         logger.info(ls.PASS_3_CALLS)
         self._process_function_calls()
@@ -537,6 +560,139 @@ class GraphUpdater:
         self._prune_orphan_nodes()
 
         self._generate_semantic_embeddings()
+
+    def _rehydrate_registry_from_graph(self) -> None:
+        # (H) Incremental runs populate the function registry only from re-parsed
+        # (H) files. Read every definition's qualified name back from the graph and
+        # (H) re-register the ones missing locally, so calls and instantiations
+        # (H) into files that were not re-parsed still resolve and their edges are
+        # (H) re-emitted. Without this, editing one file drops cross-file CALLS /
+        # (H) INSTANTIATES into any unchanged file (issue #532, outbound half).
+        if not isinstance(self.ingestor, QueryProtocol):
+            return
+        added = 0
+        for row in self.ingestor.fetch_all(cs.CYPHER_ALL_DEFINITION_QNS):
+            qn = row.get(cs.KEY_QUALIFIED_NAME)
+            label = row.get(cs.KEY_LABEL)
+            if not isinstance(qn, str) or not isinstance(label, str):
+                continue
+            if qn in self.function_registry:
+                continue
+            try:
+                node_type = NodeType(label)
+            except ValueError:
+                continue
+            self.function_registry[qn] = node_type
+            # (H) Restore the property-name set for unchanged files: property-dispatch
+            # (H) resolution (`obj.prop`) consults it, so a re-parsed file's call to a
+            # (H) @property defined elsewhere would otherwise drop vs a clean index.
+            if row.get(cs.KEY_IS_PROPERTY):
+                self.function_registry.mark_property(qn)
+            added += 1
+        if added:
+            logger.info(ls.REGISTRY_REHYDRATED, count=added)
+        self._rehydrate_class_inheritance_from_graph()
+
+    def _rehydrate_class_inheritance_from_graph(self) -> None:
+        # (H) Incremental runs rebuild class_inheritance only from re-parsed files.
+        # (H) Restore the child->bases map for classes defined in files that were
+        # (H) not re-parsed, so protocol dispatch and inherited-method resolution
+        # (H) work in Pass 3 (issue #532 residual). Only fill entries missing
+        # (H) locally: a re-parsed class already has its fresh, correctly ordered
+        # (H) bases, so we must not overwrite or duplicate them. CYPHER_ALL_INHERITS
+        # (H) is ordered by base_index, so a rehydrated class's bases keep their
+        # (H) original source order (multiple inheritance resolves the same base a
+        # (H) clean index would).
+        if not isinstance(self.ingestor, QueryProtocol):
+            return
+        class_inheritance = self.factory.definition_processor.class_inheritance
+        rows = self.ingestor.fetch_all(cs.CYPHER_ALL_INHERITS)
+        for child, bases in self._rehydrated_bases_by_child(
+            rows, class_inheritance
+        ).items():
+            class_inheritance[child] = bases
+
+    @staticmethod
+    def _rehydrated_bases_by_child(
+        rows: list[ResultRow], existing: dict[str, list[str]]
+    ) -> dict[str, list[str]]:
+        # (H) Group persisted INHERITS rows into child -> ordered bases, restoring
+        # (H) the original source order from base_index. Skip children already
+        # (H) present locally (freshly re-parsed). A class with more than one base
+        # (H) needs a reliable order (method resolution / override attribution are
+        # (H) first-match-wins over the base list); if any of its edges lacks a
+        # (H) base_index -- e.g. an INHERITS relationship written by an older index
+        # (H) before base_index existed -- the order cannot be trusted, so that
+        # (H) class is NOT rehydrated and falls back to name-based resolution rather
+        # (H) than risk binding to the wrong base. Single-base classes are
+        # (H) order-independent and always safe.
+        collected: dict[str, list[tuple[int | None, str]]] = {}
+        for row in rows:
+            child = row.get(cs.KEY_CHILD_QN)
+            base = row.get(cs.KEY_BASE_QN)
+            if not isinstance(child, str) or not isinstance(base, str):
+                continue
+            if child in existing:
+                continue
+            raw_index = row.get(cs.KEY_BASE_INDEX)
+            index = raw_index if isinstance(raw_index, int) else None
+            collected.setdefault(child, []).append((index, base))
+        result: dict[str, list[str]] = {}
+        for child, pairs in collected.items():
+            if len(pairs) > 1 and any(index is None for index, _ in pairs):
+                continue
+            pairs.sort(key=lambda pair: (pair[0] is None, pair[0] or 0))
+            result[child] = [base for _index, base in pairs]
+        return result
+
+    def _capture_inbound_edges(self, reindexed_keys: list[str]) -> list[ResultRow]:
+        # (H) Record the reference edges that unchanged files point at the
+        # (H) re-indexed files, BEFORE those files' subtrees (and thus the inbound
+        # (H) edges) are deleted. Capturing and restoring the exact edges avoids
+        # (H) re-resolving the callers, whose resolution would diverge from a clean
+        # (H) index (cgr resolution is context-sensitive).
+        if not reindexed_keys or not isinstance(self.ingestor, QueryProtocol):
+            return []
+        return self.ingestor.fetch_all(
+            cs.CYPHER_INBOUND_EDGES, {cs.CYPHER_PARAM_PATHS: reindexed_keys}
+        )
+
+    def _restore_inbound_edges(self, captured: list[ResultRow]) -> None:
+        # (H) Re-emit each captured inbound edge whose target still exists after the
+        # (H) re-index. A target that was renamed or removed is correctly left
+        # (H) without its stale inbound edge, matching a clean re-index.
+        if not captured:
+            return
+        module_label = cs.NodeLabel.MODULE.value
+        restored = 0
+        for row in captured:
+            caller_label = row.get(cs.KEY_CALLER_LABEL)
+            caller_qn = row.get(cs.KEY_CALLER_QN)
+            rel = row.get(cs.KEY_REL)
+            target_label = row.get(cs.KEY_TARGET_LABEL)
+            target_qn = row.get(cs.KEY_TARGET_QN)
+            if not (
+                isinstance(caller_label, str)
+                and isinstance(caller_qn, str)
+                and isinstance(rel, str)
+                and isinstance(target_label, str)
+                and isinstance(target_qn, str)
+            ):
+                continue
+            if target_label != module_label and target_qn not in self.function_registry:
+                continue
+            caller_key = cs.NODE_UNIQUE_CONSTRAINTS.get(caller_label)
+            target_key = cs.NODE_UNIQUE_CONSTRAINTS.get(target_label)
+            if caller_key is None or target_key is None:
+                continue
+            self.ingestor.ensure_relationship_batch(
+                (caller_label, caller_key, caller_qn),
+                rel,
+                (target_label, target_key, target_qn),
+            )
+            restored += 1
+        if restored:
+            logger.info(ls.INCREMENTAL_REBUILD_INBOUND, count=restored)
 
     def remove_file_from_state(self, file_path: Path) -> None:
         logger.debug(ls.REMOVING_STATE, path=file_path)
@@ -829,6 +985,16 @@ class GraphUpdater:
                 logger.debug(ls.FILE_HASH_NEW, path=file_key)
             changed_entries.append((filepath, file_key, is_new, file_bytes))
 
+        # (H) Before deleting any changed file's subtree (which removes the inbound
+        # (H) CALLS/IMPORTS/INSTANTIATES edges incident on it), capture those edges
+        # (H) so they can be restored verbatim afterwards (issue #532, inbound
+        # (H) half). New files have no prior inbound edges, so only re-indexed
+        # (H) (changed, non-new) files matter.
+        reindexed_keys = sorted(
+            file_key for _fp, file_key, is_new, _b in changed_entries if not is_new
+        )
+        captured_inbound = self._capture_inbound_edges(reindexed_keys)
+
         pre_parsed = self._pre_parse_changed_files(changed_entries)
 
         with Progress(
@@ -877,6 +1043,8 @@ class GraphUpdater:
                     self.ingestor.execute_write(
                         cs.CYPHER_DELETE_FILE, {cs.KEY_PATH: deleted_key}
                     )
+
+        self._restore_inbound_edges(captured_inbound)
 
         if skipped_count > 0:
             logger.info(ls.INCREMENTAL_SKIPPED, count=skipped_count)
@@ -948,15 +1116,42 @@ class GraphUpdater:
             if result:
                 root_node, language = result
                 self.ast_cache[filepath] = (root_node, language)
+                self._parsed_files.append((filepath, language))
         elif self._is_dependency_file(filepath.name, filepath):
             self.factory.definition_processor.process_dependencies(filepath)
 
         self.factory.structure_processor.process_generic_file(filepath, filepath.name)
 
+    def _ast_for(self, file_path: Path, language: cs.SupportedLanguage) -> Node | None:
+        # (H) Return the file's AST from the bounded cache, or re-parse from disk
+        # (H) when it was evicted. Evicted files carry stale captures (nodes from
+        # (H) the discarded tree), so drop them: downstream recomputes captures
+        # (H) from this fresh tree. Re-caching keeps the cache bounded across the
+        # (H) two Pass-3 loops.
+        if file_path in self.ast_cache:
+            return self.ast_cache[file_path][0]
+        parser = self.queries[language].get(cs.KEY_PARSER)
+        if parser is None:
+            return None
+        try:
+            file_bytes = file_path.read_bytes()
+        except OSError as e:
+            logger.error(ls.CALL_PROCESSING_FAILED, path=file_path, error=e)
+            return None
+        root_node = parser.parse(file_bytes).root_node
+        self.ast_cache[file_path] = (root_node, language)
+        self.factory._func_class_captures_cache.pop(file_path, None)
+        return root_node
+
     def _process_function_calls(self) -> None:
         captures_cache = self.factory._func_class_captures_cache
-        ast_cache_items = list(self.ast_cache.items())
-        for file_path, (root_node, language) in ast_cache_items:
+        # (H) Iterate every file parsed this run, not the bounded AST cache: on a
+        # (H) large repo the cache evicts most files, and iterating it drops their
+        # (H) calls (a whole module ends up with zero CALLS edges).
+        for file_path, language in self._parsed_files:
+            root_node = self._ast_for(file_path, language)
+            if root_node is None:
+                continue
             self.factory.call_processor.collect_callable_field_bindings(
                 file_path,
                 root_node,
@@ -964,7 +1159,10 @@ class GraphUpdater:
                 self.queries,
                 func_class_captures_cache=captures_cache,
             )
-        for file_path, (root_node, language) in ast_cache_items:
+        for file_path, language in self._parsed_files:
+            root_node = self._ast_for(file_path, language)
+            if root_node is None:
+                continue
             if captures_cache is not None and file_path in captures_cache:
                 cached = captures_cache[file_path]
                 if not cached.get(cs.CAPTURE_CALL) and not cached.get(

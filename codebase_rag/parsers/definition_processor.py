@@ -12,6 +12,7 @@ from ..parser_loader import COMBINED_FUNC_CLASS_IMPORT_QUERIES
 from ..types_defs import ASTNode, FunctionRegistryTrieProtocol, SimpleNameLookup
 from ..utils.path_utils import cached_relative_path, cached_resolve_posix
 from .class_ingest import ClassIngestMixin
+from .cpp import CppTypeInferenceEngine
 from .dependency_parser import parse_dependencies
 from .function_ingest import FunctionIngestMixin
 from .handlers import get_handler
@@ -52,8 +53,22 @@ class DefinitionProcessor(
         self.import_processor = import_processor
         self.module_qn_to_file_path = module_qn_to_file_path
         self.class_inheritance: dict[str, list[str]] = {}
+        # (H) {class_qn: {field_name: bare_type_name}} for C++ member fields, so a
+        # (H) member call `field_.method()` in a (possibly out-of-line, cross-file)
+        # (H) method resolves via the field's declared type. Populated at class
+        # (H) ingestion, read by the type-inference engine at call resolution.
+        self.class_field_types: dict[str, dict[str, str]] = {}
+        # (H) {alias_name: underlying_bare_type} for C++ typedef/using aliases, so a
+        # (H) receiver declared with an alias resolves to the aliased class. Collected
+        # (H) across all files (an alias in a header is used in a .cc), read by the
+        # (H) resolver when mapping a receiver type name to a class.
+        self.type_aliases: dict[str, str] = {}
+        # (H) Alias names seen with conflicting underlying types across scopes/files;
+        # (H) dropped from type_aliases so their receivers fall back to name-only.
+        self._type_alias_conflicts: set[str] = set()
         self._deferred_cpp_methods: list = []
         self._deferred_go_methods: list = []
+        self._deferred_forward_decls: list = []
         self._handler = get_handler(cs.SupportedLanguage.PYTHON)
         self._func_class_captures_cache = func_class_captures_cache
 
@@ -176,6 +191,9 @@ class DefinitionProcessor(
                 )
             if language == cs.SupportedLanguage.CPP:
                 self._ingest_cpp_module_declarations(root_node, module_qn, file_path)
+                CppTypeInferenceEngine().collect_type_aliases(
+                    root_node, self.type_aliases, self._type_alias_conflicts
+                )
             self._ingest_all_functions(
                 root_node,
                 module_qn,
