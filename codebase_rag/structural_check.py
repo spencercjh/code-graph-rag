@@ -27,6 +27,7 @@ from .config import load_ignore_patterns
 from .graph_updater import GraphUpdater, _load_exclusion_state
 from .structural_delta import StructuralDelta, normalise_paths, observe
 from .types_defs import LanguageQueries
+from .utils.path_utils import derive_project_name
 
 _GIT_DELETED = "D"
 
@@ -49,6 +50,18 @@ def changed_since(repo_root: Path, base: str) -> tuple[list[str], list[str]]:
         # as a diff option (`--cached` compares the index) rather than a
         # revision, and the check would measure the wrong files.
         raise CheckError(cs.CHECK_BAD_BASE.format(base=base))
+    # A range (`HEAD~1..HEAD`, `main...HEAD`) makes `git diff` compare its
+    # endpoints instead of a commit with the working tree, silently leaving
+    # the current edits out; only a value naming one commit is a base.
+    verified = subprocess.run(
+        [cs.SHELL_CMD_GIT, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+        cwd=repo_root,
+        capture_output=True,
+        encoding=cs.ENCODING_UTF8,
+        check=False,
+    )
+    if verified.returncode != 0:
+        raise CheckError(cs.CHECK_BASE_NOT_A_COMMIT.format(base=base))
     try:
         status = subprocess.run(
             # `--relative`: paths relative to `repo_root`, which may sit below
@@ -114,7 +127,15 @@ def indexed_scope(
     stored = _load_exclusion_state(repo_root / cs.EXCLUSION_STATE_FILENAME)
     if stored is not None:
         owner = stored.get("project")
-        if isinstance(owner, str) and owner != project_name:
+        # `cgr index` without --project stamps the bare directory name while
+        # `cgr check` derives the digest-suffixed one: every name this tree
+        # goes by is this project, not another one.
+        own_names = {
+            project_name,
+            derive_project_name(repo_root),
+            repo_root.resolve().name,
+        }
+        if isinstance(owner, str) and owner not in own_names:
             raise CheckError(
                 cs.CHECK_SCOPE_OF_OTHER_PROJECT.format(
                     project=project_name, other=owner

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,10 @@ FIXTURE: dict[str, str] = {
         "from pkg.app import run\n\n\ndef test_run():\n    assert run() == 2\n"
     ),
 }
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
 
 
 def _write(root: Path, rel: str, text: str) -> None:
@@ -740,3 +745,62 @@ def test_moved_definition_is_paired_across_files(
     ]
     assert delta["symbols"]["added"] == [] and delta["symbols"]["removed"] == []
     assert delta["new_duplicates"] == []
+
+
+def test_check_accepts_a_stamp_written_under_the_repositorys_default_name(
+    temp_repo: Path,
+) -> None:
+    from codebase_rag.structural_check import CheckError, indexed_scope
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    parsers, queries = __import__(
+        "codebase_rag.parser_loader", fromlist=["load_parsers"]
+    ).load_parsers()
+    # `cgr index` without --project: GraphUpdater stamps the bare directory
+    # name, while `cgr check` derives the digest-suffixed one for the same tree.
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        exclude_paths=frozenset({"generated_src"}),
+    ).run(force=True)
+    assert indexed_scope(root, derive_project_name(root)) == (
+        frozenset({"generated_src"}),
+        None,
+    )
+    # A stamp from a project that is not this tree under any name still refuses.
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name="other_project",
+    ).run(force=True)
+    with pytest.raises(CheckError):
+        indexed_scope(root, derive_project_name(root))
+
+
+@pytest.mark.parametrize("base", ["HEAD~1..HEAD", "HEAD~1...HEAD", "no-such-rev"])
+def test_check_refuses_a_base_that_is_not_one_commit(
+    temp_repo: Path, base: str
+) -> None:
+    from codebase_rag.structural_check import CheckError, changed_since
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "one")
+    _write(root, "pkg/extra.py", "X = 1\n")
+    _git(root, "add", "-A")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "two")
+    # The range would compare the two commits and miss this working-tree edit.
+    _write(root, "pkg/extra.py", "X = 2\n")
+    with pytest.raises(CheckError, match="one commit"):
+        changed_since(root, base)
+    assert changed_since(root, "HEAD") == (["pkg/extra.py"], [])
