@@ -544,7 +544,7 @@ def test_check_rejects_a_dash_prefixed_base(temp_repo: Path) -> None:
     assert changed_since(root, "HEAD") == (["pkg/util.py"], [])
 
 
-def test_check_reads_paths_with_whitespace_in_their_names(temp_repo: Path) -> None:
+def test_check_reads_paths_git_would_c_quote(temp_repo: Path) -> None:
     import subprocess
 
     from codebase_rag.structural_check import changed_since
@@ -559,12 +559,14 @@ def test_check_reads_paths_with_whitespace_in_their_names(temp_repo: Path) -> No
         cwd=root,
         check=True,
     )
-    # Git C-quotes such names in its default output; `-z` keeps them raw.
-    # A space rather than a tab: git C-quotes both, so the assertion still
-    # fails without `-z`, but a tab is not a legal NTFS filename character
-    # and the fixture write itself raised OSError on the Windows runners.
-    _write(root, "pkg/odd name.py", "def odd():\n    return 1\n")
-    assert changed_since(root, "HEAD") == (["pkg/odd name.py"], [])
+    # Git C-quotes non-ASCII bytes in its default output; `-z` keeps them
+    # raw. A space would NOT do here: git leaves a space bare in
+    # `ls-files --others`, so the fixture has to carry a byte git actually
+    # quotes or the test stops detecting the quoting bug. A tab is quoted
+    # but is not a legal NTFS filename character, and the fixture write
+    # itself raised OSError on the Windows runners.
+    _write(root, "pkg/odd\u00e9name.py", "def odd():\n    return 1\n")
+    assert changed_since(root, "HEAD") == (["pkg/odd\u00e9name.py"], [])
 
 
 def test_check_uses_the_scope_the_graph_was_indexed_under(temp_repo: Path) -> None:
