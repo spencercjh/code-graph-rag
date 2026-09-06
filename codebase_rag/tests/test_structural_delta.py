@@ -128,7 +128,8 @@ def test_rename_without_updating_callers_reports_dangling_callers(
             "path": "pkg/util.py",
         }
     ]
-    assert delta["symbols"]["added"] == [] and delta["symbols"]["removed"] == []
+    assert delta["symbols"]["added"] == []
+    assert delta["symbols"]["removed"] == []
     assert delta["dangling_callers"] == [
         {
             "caller": _qn("pkg.app.run"),
@@ -196,9 +197,11 @@ def test_signature_change_lists_every_site_with_a_verdict(
 
     assert delta["symbols"]["changed"] == [_qn("pkg.util.helper")]
     (change,) = delta["signature_changes"]
-    assert change["before"] == ["a"] and change["after"] == ["a", "b"]
+    assert change["before"] == ["a"]
+    assert change["after"] == ["a", "b"]
     (site,) = change["sites"]
-    assert site["path"] == "pkg/app.py" and site["line"] == 5
+    assert site["path"] == "pkg/app.py"
+    assert site["line"] == 5
     assert site["verdict"] == cs.DELTA_ARITY_POSSIBLY_MISSING
     assert site["declared_count"] == 2
 
@@ -271,7 +274,8 @@ def test_pasting_a_helper_under_a_new_name_is_a_new_duplicate(
     assert delta["symbols"]["added"] == [_qn("pkg.extra.summarise")]
     (duplicate,) = delta["new_duplicates"]
     assert duplicate["qualified_name"] == _qn("pkg.extra.summarise")
-    assert duplicate["kind"] == cs.KIND_EXACT and duplicate["similarity"] == 1.0
+    assert duplicate["kind"] == cs.KIND_EXACT
+    assert duplicate["similarity"] == 1.0
     assert duplicate["original"] == {
         "qualified_name": _qn("pkg.util.tally"),
         "path": "pkg/util.py",
@@ -709,7 +713,8 @@ def test_check_ignores_cgr_state_files(
     assert changed_since(root, "HEAD") == ([], [])
     parsers, queries = load_parsers()
     delta = run_check(root, "HEAD", PROJECT, store, parsers, queries)
-    assert delta["paths"] == [] and delta["reparsed"] == []
+    assert delta["paths"] == []
+    assert delta["reparsed"] == []
 
 
 def test_keyword_arguments_are_counted_once(
@@ -748,7 +753,8 @@ def test_moved_definition_is_paired_across_files(
             "path": "pkg/util.py",
         }
     ]
-    assert delta["symbols"]["added"] == [] and delta["symbols"]["removed"] == []
+    assert delta["symbols"]["added"] == []
+    assert delta["symbols"]["removed"] == []
     assert delta["new_duplicates"] == []
 
 
@@ -785,8 +791,53 @@ def test_check_accepts_a_stamp_written_under_the_repositorys_default_name(
         queries=queries,
         project_name="other_project",
     ).run(force=True)
+    own_name = derive_project_name(root)
     with pytest.raises(CheckError):
-        indexed_scope(root, derive_project_name(root))
+        indexed_scope(root, own_name)
+
+
+def test_check_refuses_the_default_names_stamp_for_a_named_project(
+    temp_repo: Path,
+) -> None:
+    """An explicit --project owns only its own name.
+
+    The unnamed-run names (derived and bare directory) are what this tree
+    would have been called had the run not named it, so lending them to a
+    DIFFERENT explicitly requested project applies one project's exclusions
+    to another's graph.
+    """
+    from codebase_rag.structural_check import CheckError, indexed_scope
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    parsers, queries = __import__(
+        "codebase_rag.parser_loader", fromlist=["load_parsers"]
+    ).load_parsers()
+    # An unnamed run: stamps the bare directory name, excluding `generated_src`.
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        exclude_paths=frozenset({"generated_src"}),
+    ).run(force=True)
+    # `cgr check --project other_project` must NOT inherit that scope.
+    with pytest.raises(CheckError):
+        indexed_scope(root, "other_project", explicit=True)
+    # The same stamp still serves the unnamed run it belongs to.
+    assert indexed_scope(root, derive_project_name(root)) == (
+        frozenset({"generated_src"}),
+        None,
+    )
+    # Naming this tree explicitly by either spelling of its own identity is
+    # still this project: `list_projects` shows the derived name, so
+    # `--project <derived>` against a bare-name stamp must not be refused.
+    assert indexed_scope(root, derive_project_name(root), explicit=True) == (
+        frozenset({"generated_src"}),
+        None,
+    )
 
 
 @pytest.mark.parametrize("base", ["HEAD~1..HEAD", "HEAD~1...HEAD", "no-such-rev"])

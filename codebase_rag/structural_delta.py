@@ -560,6 +560,46 @@ def _match_duplicate_shapes(
     return None
 
 
+def _best_duplicate_match(
+    candidate: _Shape,
+    shapes: list[_Shape],
+    fresh_set: set[str],
+    threshold: float,
+) -> tuple[float, _Shape, str] | None:
+    """The most similar prior shape `candidate` duplicates, if any."""
+    best: tuple[float, _Shape, str] | None = None
+    for other in shapes:
+        found = _match_duplicate_shapes(candidate, other, threshold)
+        # An existing symbol is the original; a fresh one is at best a
+        # peer, reported once from the lexically earlier side.
+        if found is None or (
+            other.qualified_name in fresh_set
+            and other.qualified_name < candidate.qualified_name
+        ):
+            continue
+        kind, similarity = found
+        if best is None or similarity > best[0]:
+            best = (similarity, other, kind)
+    return best
+
+
+def _new_duplicate(
+    candidate: _Shape, other: _Shape, kind: str, similarity: float
+) -> NewDuplicate:
+    return NewDuplicate(
+        qualified_name=candidate.qualified_name,
+        path=candidate.path,
+        start_line=candidate.start_line,
+        kind=kind,
+        similarity=round(similarity, 3),
+        original=DuplicateOriginal(
+            qualified_name=other.qualified_name,
+            path=other.path,
+            start_line=other.start_line,
+        ),
+    )
+
+
 def _new_duplicates(
     fetch_all: QueryFn,
     project_name: str,
@@ -580,85 +620,82 @@ def _new_duplicates(
     for candidate in shapes:
         if candidate.qualified_name not in fresh_set:
             continue
-        best: tuple[float, _Shape, str] | None = None
-        for other in shapes:
-            found = _match_duplicate_shapes(candidate, other, threshold)
-            # An existing symbol is the original; a fresh one is at best a
-            # peer, reported once from the lexically earlier side.
-            if found is None or (
-                other.qualified_name in fresh_set
-                and other.qualified_name < candidate.qualified_name
-            ):
-                continue
-            kind, similarity = found
-            if best is None or similarity > best[0]:
-                best = (similarity, other, kind)
+        best = _best_duplicate_match(candidate, shapes, fresh_set, threshold)
         if best is not None:
             similarity, other, kind = best
-            out.append(
-                NewDuplicate(
-                    qualified_name=candidate.qualified_name,
-                    path=candidate.path,
-                    start_line=candidate.start_line,
-                    kind=kind,
-                    similarity=round(similarity, 3),
-                    original=DuplicateOriginal(
-                        qualified_name=other.qualified_name,
-                        path=other.path,
-                        start_line=other.start_line,
-                    ),
-                )
-            )
+            out.append(_new_duplicate(candidate, other, kind, similarity))
     return sorted(out, key=lambda d: (d["path"], d["start_line"], d["qualified_name"]))
 
 
 # --- import cycles ------------------------------------------------------------
 
 
+class _TarjanState:
+    """The bookkeeping Tarjan's algorithm carries between its two phases."""
+
+    def __init__(self) -> None:
+        self.index: dict[str, int] = {}
+        self.low: dict[str, int] = {}
+        self.on_stack: set[str] = set()
+        self.stack: list[str] = []
+        self.counter = 0
+
+    def enter(self, node: str) -> None:
+        """Number `node` and push it onto the current path."""
+        self.index[node] = self.low[node] = self.counter
+        self.counter += 1
+        self.stack.append(node)
+        self.on_stack.add(node)
+
+    def pop_component(self, root: str) -> frozenset[str]:
+        """Unwind the path down to `root`, which closes one SCC."""
+        component: set[str] = set()
+        while True:
+            member = self.stack.pop()
+            self.on_stack.discard(member)
+            component.add(member)
+            if member == root:
+                return frozenset(component)
+
+
+def _tarjan_descend(
+    state: _TarjanState,
+    graph: dict[str, frozenset[str]],
+    work: list[tuple[str, Iterable[str]]],
+    node: str,
+    child: str,
+) -> None:
+    """Follow one edge: recurse into an unseen child, else relax the low-link."""
+    if child not in state.index:
+        state.enter(child)
+        work.append((child, iter(sorted(graph.get(child, ())))))
+    elif child in state.on_stack:
+        state.low[node] = min(state.low[node], state.index[child])
+
+
 def strongly_connected(graph: dict[str, frozenset[str]]) -> list[frozenset[str]]:
     """Tarjan's SCCs, iteratively (a module graph can be thousands deep)."""
-    index: dict[str, int] = {}
-    low: dict[str, int] = {}
-    on_stack: set[str] = set()
-    stack: list[str] = []
+    state = _TarjanState()
     out: list[frozenset[str]] = []
-    counter = 0
     for root in sorted(graph):
-        if root in index:
+        if root in state.index:
             continue
         work: list[tuple[str, Iterable[str]]] = [
             (root, iter(sorted(graph.get(root, ()))))
         ]
-        index[root] = low[root] = counter
-        counter += 1
-        stack.append(root)
-        on_stack.add(root)
+        state.enter(root)
         while work:
             node, children = work[-1]
             child = next(children, None)
             if child is not None:
-                if child not in index:
-                    index[child] = low[child] = counter
-                    counter += 1
-                    stack.append(child)
-                    on_stack.add(child)
-                    work.append((child, iter(sorted(graph.get(child, ())))))
-                elif child in on_stack:
-                    low[node] = min(low[node], index[child])
+                _tarjan_descend(state, graph, work, node, child)
                 continue
             work.pop()
             if work:
                 parent = work[-1][0]
-                low[parent] = min(low[parent], low[node])
-            if low[node] == index[node]:
-                component: set[str] = set()
-                while True:
-                    member = stack.pop()
-                    on_stack.discard(member)
-                    component.add(member)
-                    if member == node:
-                        break
-                out.append(frozenset(component))
+                state.low[parent] = min(state.low[parent], state.low[node])
+            if state.low[node] == state.index[node]:
+                out.append(state.pop_component(node))
     return out
 
 
@@ -699,7 +736,7 @@ def _walk_callers(fetch_all: QueryFn, prefix: str, targets: set[str]) -> _Reach:
     a project-wide reverse call graph costs more to build than most deltas
     take in total.
     """
-    depth = {qn: 0 for qn in targets}
+    depth = dict.fromkeys(targets, 0)
     through = {qn: qn for qn in targets}
     nodes: dict[_NodeId, PropertyDict] = {}
     frontier = sorted(targets)
