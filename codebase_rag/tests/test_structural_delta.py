@@ -560,8 +560,11 @@ def test_check_reads_paths_with_whitespace_in_their_names(temp_repo: Path) -> No
         check=True,
     )
     # Git C-quotes such names in its default output; `-z` keeps them raw.
-    _write(root, "pkg/odd\tname.py", "def odd():\n    return 1\n")
-    assert changed_since(root, "HEAD") == (["pkg/odd\tname.py"], [])
+    # A space rather than a tab: git C-quotes both, so the assertion still
+    # fails without `-z`, but a tab is not a legal NTFS filename character
+    # and the fixture write itself raised OSError on the Windows runners.
+    _write(root, "pkg/odd name.py", "def odd():\n    return 1\n")
+    assert changed_since(root, "HEAD") == (["pkg/odd name.py"], [])
 
 
 def test_check_uses_the_scope_the_graph_was_indexed_under(temp_repo: Path) -> None:
