@@ -112,7 +112,7 @@ def changed_since(repo_root: Path, base: str) -> tuple[list[str], list[str]]:
 
 
 def indexed_scope(
-    repo_root: Path, project_name: str
+    repo_root: Path, project_name: str, *, explicit: bool = False
 ) -> tuple[frozenset[str] | None, frozenset[str] | None]:
     """The exclusion scope `project_name`'s graph was last indexed under.
 
@@ -123,18 +123,25 @@ def indexed_scope(
     repository, so one written by ANOTHER project indexed from this tree
     refuses the check rather than lending that project's scope. Without a
     stamp the `.cgrignore` file is the only scope there is.
+
+    `explicit` says the caller named the project with `--project`. Then
+    only that exact name is this project: the derived and bare directory
+    names are what an UNNAMED run would have been called, so admitting
+    them would lend a differently-named project's scope.
     """
     stored = _load_exclusion_state(repo_root / cs.EXCLUSION_STATE_FILENAME)
     if stored is not None:
         owner = stored.get("project")
-        # `cgr index` without --project stamps the bare directory name while
-        # `cgr check` derives the digest-suffixed one: every name this tree
-        # goes by is this project, not another one.
-        own_names = {
-            project_name,
-            derive_project_name(repo_root),
-            repo_root.resolve().name,
-        }
+        # `cgr index` without --project stamps the bare directory name
+        # while `cgr check` derives the digest-suffixed one, so both are
+        # this tree's own identity and stay interchangeable however the
+        # project was named. What `explicit` withholds is the right to
+        # answer to those default names while asking for a DIFFERENT
+        # project: then only the requested name owns the stamp.
+        default_names = {derive_project_name(repo_root), repo_root.resolve().name}
+        own_names = {project_name}
+        if not explicit or project_name in default_names:
+            own_names |= default_names
         if isinstance(owner, str) and owner not in own_names:
             raise CheckError(
                 cs.CHECK_SCOPE_OF_OTHER_PROJECT.format(
