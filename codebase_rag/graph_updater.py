@@ -225,14 +225,28 @@ def _save_delombok_state(state_path: Path, state: dict) -> None:
 def _exclusion_state(
     exclude_paths: frozenset[str] | None,
     unignore_paths: frozenset[str] | None,
-) -> dict[str, list[str]]:
-    return {
+    project_name: str | None = None,
+    named: bool = False,
+) -> dict[str, list[str] | str]:
+    state: dict[str, list[str] | str] = {
         "exclude": sorted(exclude_paths or ()),
         "unignore": sorted(unignore_paths or ()),
     }
+    if project_name is not None:
+        # The stamp is per repository; two projects indexed from the same
+        # tree overwrite it, so a reader must know whose scope it holds.
+        state["project"] = project_name
+        # `named` records whether --project was GIVEN rather than defaulted
+        # to the directory name. Without it the two are the same string and
+        # a reader cannot tell a project deliberately called `myrepo` from
+        # the tree's own default, so one lends the other its scope
+        # (issue #1525). Absent on stamps written before this field: those
+        # read as unnamed, which is what they were in the common case.
+        state["named"] = "1" if named else ""
+    return state
 
 
-def _load_exclusion_state(state_path: Path) -> dict[str, list[str]] | None:
+def _load_exclusion_state(state_path: Path) -> dict[str, list[str] | str] | None:
     """The exclusion set the last completed run indexed under, or None.
 
     None means "cannot be established" and must be read as changed by the
@@ -245,16 +259,26 @@ def _load_exclusion_state(state_path: Path) -> dict[str, list[str]] | None:
         return None
     if not isinstance(loaded, dict):
         return None
-    result: dict[str, list[str]] = {}
+    result: dict[str, list[str] | str] = {}
     for key in ("exclude", "unignore"):
         values = loaded.get(key)
         if not isinstance(values, list):
             return None
         result[key] = sorted(v for v in values if isinstance(v, str))
+    project = loaded.get("project")
+    if isinstance(project, str):
+        result["project"] = project
+    # Whether that project was named with --project rather than defaulted to
+    # the directory name. Absent on stamps written before the field existed,
+    # which read as unnamed -- what they were, unless someone named a project
+    # after its own directory.
+    named = loaded.get("named")
+    if isinstance(named, str) and named:
+        result["named"] = named
     return result
 
 
-def _save_exclusion_state(state_path: Path, state: dict[str, list[str]]) -> None:
+def _save_exclusion_state(state_path: Path, state: dict[str, list[str] | str]) -> None:
     try:
         state_path.write_text(
             json.dumps(state, sort_keys=True), encoding=cs.ENCODING_UTF8
@@ -755,6 +779,7 @@ class GraphUpdater:
         self.repo_path = repo_path
         self.parsers = parsers
         self.queries = queries
+        self.project_named = bool(project_name and project_name.strip())
         self.project_name = (
             project_name and project_name.strip()
         ) or repo_path.resolve().name
@@ -1810,7 +1835,12 @@ class GraphUpdater:
             else:
                 _save_exclusion_state(
                     self.repo_path / cs.EXCLUSION_STATE_FILENAME,
-                    _exclusion_state(self.exclude_paths, self.unignore_paths),
+                    _exclusion_state(
+                        self.exclude_paths,
+                        self.unignore_paths,
+                        self.project_name,
+                        named=self.project_named,
+                    ),
                 )
 
     def _emit_pending_endpoints(self, only: set[str] | None = None) -> None:
@@ -3317,6 +3347,10 @@ class GraphUpdater:
             return self._exclusion_match
         stored = _load_exclusion_state(self.repo_path / cs.EXCLUSION_STATE_FILENAME)
         current = _exclusion_state(self.exclude_paths, self.unignore_paths)
+        # The project key is informational for readers such as `cgr check`;
+        # the sync decision compares the scope itself, as it always has.
+        if stored is not None:
+            stored = {k: v for k, v in stored.items() if k != "project"}
         if stored == current:
             self._exclusion_match = True
             return True
