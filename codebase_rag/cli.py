@@ -1136,9 +1136,7 @@ def check_command(
             typer.echo(cs.CHECK_NOT_INDEXED.format(project=name), err=True)
             raise typer.Exit(code=1)
         try:
-            exclude_paths, unignore_paths = indexed_scope(
-                root, name, explicit=project is not None
-            )
+            exclude_paths, unignore_paths = indexed_scope(root, name)
             delta = run_check(
                 root,
                 base,

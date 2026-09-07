@@ -226,6 +226,7 @@ def _exclusion_state(
     exclude_paths: frozenset[str] | None,
     unignore_paths: frozenset[str] | None,
     project_name: str | None = None,
+    named: bool = False,
 ) -> dict[str, list[str] | str]:
     state: dict[str, list[str] | str] = {
         "exclude": sorted(exclude_paths or ()),
@@ -235,6 +236,13 @@ def _exclusion_state(
         # The stamp is per repository; two projects indexed from the same
         # tree overwrite it, so a reader must know whose scope it holds.
         state["project"] = project_name
+        # `named` records whether --project was GIVEN rather than defaulted
+        # to the directory name. Without it the two are the same string and
+        # a reader cannot tell a project deliberately called `myrepo` from
+        # the tree's own default, so one lends the other its scope
+        # (issue #1525). Absent on stamps written before this field: those
+        # read as unnamed, which is what they were in the common case.
+        state["named"] = "1" if named else ""
     return state
 
 
@@ -260,6 +268,13 @@ def _load_exclusion_state(state_path: Path) -> dict[str, list[str] | str] | None
     project = loaded.get("project")
     if isinstance(project, str):
         result["project"] = project
+    # Whether that project was named with --project rather than defaulted to
+    # the directory name. Absent on stamps written before the field existed,
+    # which read as unnamed -- what they were, unless someone named a project
+    # after its own directory.
+    named = loaded.get("named")
+    if isinstance(named, str) and named:
+        result["named"] = named
     return result
 
 
@@ -764,6 +779,7 @@ class GraphUpdater:
         self.repo_path = repo_path
         self.parsers = parsers
         self.queries = queries
+        self.project_named = bool(project_name and project_name.strip())
         self.project_name = (
             project_name and project_name.strip()
         ) or repo_path.resolve().name
@@ -1820,7 +1836,10 @@ class GraphUpdater:
                 _save_exclusion_state(
                     self.repo_path / cs.EXCLUSION_STATE_FILENAME,
                     _exclusion_state(
-                        self.exclude_paths, self.unignore_paths, self.project_name
+                        self.exclude_paths,
+                        self.unignore_paths,
+                        self.project_name,
+                        named=self.project_named,
                     ),
                 )
 

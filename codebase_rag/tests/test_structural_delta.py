@@ -825,19 +825,54 @@ def test_check_refuses_the_default_names_stamp_for_a_named_project(
     ).run(force=True)
     # `cgr check --project other_project` must NOT inherit that scope.
     with pytest.raises(CheckError):
-        indexed_scope(root, "other_project", explicit=True)
-    # The same stamp still serves the unnamed run it belongs to.
+        indexed_scope(root, "other_project")
+    # The same stamp still serves the unnamed run it belongs to, under
+    # either spelling of this tree's identity: `list_projects` shows the
+    # derived name, so asking by that name must not be refused.
     assert indexed_scope(root, derive_project_name(root)) == (
         frozenset({"generated_src"}),
         None,
     )
-    # Naming this tree explicitly by either spelling of its own identity is
-    # still this project: `list_projects` shows the derived name, so
-    # `--project <derived>` against a bare-name stamp must not be refused.
-    assert indexed_scope(root, derive_project_name(root), explicit=True) == (
+    assert indexed_scope(root, root.name) == (
         frozenset({"generated_src"}),
         None,
     )
+
+
+def test_check_refuses_a_named_projects_stamp_for_the_default_project(
+    temp_repo: Path,
+) -> None:
+    """A project named after its own directory is not the default project.
+
+    `cgr index --project myrepo` in a tree called `myrepo` writes a stamp
+    whose owner string is identical to the one an unnamed run would write,
+    so the name alone cannot say which it was. The stamp records it, and
+    the default (digest-derived) project must not inherit that scope.
+    """
+    from codebase_rag.structural_check import CheckError, indexed_scope
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    parsers, queries = __import__(
+        "codebase_rag.parser_loader", fromlist=["load_parsers"]
+    ).load_parsers()
+    # Named explicitly, and the name happens to equal the directory name.
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        project_name=root.name,
+        exclude_paths=frozenset({"generated_src"}),
+    ).run(force=True)
+    # The default project is a different graph and must not take that scope.
+    own_name = derive_project_name(root)
+    with pytest.raises(CheckError):
+        indexed_scope(root, own_name)
+    # The project it belongs to still reads it.
+    assert indexed_scope(root, root.name) == (frozenset({"generated_src"}), None)
 
 
 @pytest.mark.parametrize("base", ["HEAD~1..HEAD", "HEAD~1...HEAD", "no-such-rev"])

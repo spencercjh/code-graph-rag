@@ -111,8 +111,17 @@ def changed_since(repo_root: Path, base: str) -> tuple[list[str], list[str]]:
     return sorted(changed), sorted(deleted)
 
 
+def _stamp_is_named(stored: dict[str, list[str] | str]) -> bool:
+    """Whether the run that wrote this stamp was given an explicit --project.
+
+    Stamps written before the field existed have no `named` key; they read
+    as unnamed, which is what the overwhelming majority of them were.
+    """
+    return bool(stored.get("named"))
+
+
 def indexed_scope(
-    repo_root: Path, project_name: str, *, explicit: bool = False
+    repo_root: Path, project_name: str
 ) -> tuple[frozenset[str] | None, frozenset[str] | None]:
     """The exclusion scope `project_name`'s graph was last indexed under.
 
@@ -124,25 +133,34 @@ def indexed_scope(
     refuses the check rather than lending that project's scope. Without a
     stamp the `.cgrignore` file is the only scope there is.
 
-    `explicit` says the caller named the project with `--project`. Then
-    only that exact name is this project: the derived and bare directory
-    names are what an UNNAMED run would have been called, so admitting
-    them would lend a differently-named project's scope.
+    Ownership comes from the stamp, which records whether the run that
+    wrote it was given a `--project`. A named run's scope is owned by that
+    name alone; an unnamed run's is this tree's, under either spelling.
     """
     stored = _load_exclusion_state(repo_root / cs.EXCLUSION_STATE_FILENAME)
     if stored is not None:
         owner = stored.get("project")
-        # `cgr index` without --project stamps the bare directory name
-        # while `cgr check` derives the digest-suffixed one, so both are
-        # this tree's own identity and stay interchangeable however the
-        # project was named. What `explicit` withholds is the right to
-        # answer to those default names while asking for a DIFFERENT
-        # project: then only the requested name owns the stamp.
+        # A stamp the writer marked `named` belongs to a project someone
+        # asked for by name, and only that exact name owns it. An unnamed
+        # run's stamp carries the bare directory name while `cgr check`
+        # derives the digest-suffixed one, so for THAT stamp both spellings
+        # of this tree's identity are the same project and stay
+        # interchangeable. Comparing name shapes cannot separate the two
+        # cases: a project deliberately called `myrepo` and a default that
+        # fell back to `myrepo` are one string (issue #1525).
+        # The stamp is ours when its owner IS the project asked for. An
+        # unnamed run's stamp additionally serves the other spelling of this
+        # tree's own identity, since `cgr index` records the bare directory
+        # name where `cgr check` derives the digest-suffixed one -- but only
+        # when the project asked for is itself one of those two defaults,
+        # never for a third, unrelated name.
         default_names = {derive_project_name(repo_root), repo_root.resolve().name}
-        own_names = {project_name}
-        if not explicit or project_name in default_names:
-            own_names |= default_names
-        if isinstance(owner, str) and owner not in own_names:
+        mine = owner == project_name or (
+            not _stamp_is_named(stored)
+            and owner in default_names
+            and project_name in default_names
+        )
+        if isinstance(owner, str) and not mine:
             raise CheckError(
                 cs.CHECK_SCOPE_OF_OTHER_PROJECT.format(
                     project=project_name, other=owner
