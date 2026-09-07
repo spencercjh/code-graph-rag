@@ -252,9 +252,13 @@ class _StatefulIngestor:
             qn = _str(props.get(cs.KEY_QUALIFIED_NAME))
             if not qn or label in self._DELTA_SKIPPED_LABELS:
                 continue
-            if paths is not None and (
-                not qn.startswith(prefix) or props.get(cs.KEY_PATH) not in paths
-            ):
+            # The project prefix binds on BOTH branches: the by-qn lookup is
+            # reached with callee names that CYPHER_DELTA_SITES did not
+            # prefix-scope, so a shared graph can hold a same-named
+            # definition from another project.
+            if not qn.startswith(prefix):
+                continue
+            if paths is not None and props.get(cs.KEY_PATH) not in paths:
                 continue
             if qns is not None and qn not in qns:
                 continue

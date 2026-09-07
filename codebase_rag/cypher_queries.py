@@ -446,8 +446,13 @@ WHERE n.qualified_name STARTS WITH $project_prefix AND n.path IN $paths
 {_DELTA_DEFINITION_FIELDS}"""
 # The callees of the touched files' sites that live elsewhere: their
 # declared parameters decide the arity verdict of each site.
+# `$project_prefix` as well as `$qns`: the callee side of CYPHER_DELTA_SITES
+# is not prefix-scoped, so an unresolved or external target name can reach
+# this lookup, and a shared graph holding several projects would otherwise
+# let a same-named definition from another project decide the arity verdict.
 CYPHER_DELTA_DEFINITIONS_BY_QN = f"""MATCH (n:{_DELTA_DEFINITION_LABELS})
 WHERE n.qualified_name IN $qns
+  AND n.qualified_name STARTS WITH $project_prefix
 {_DELTA_DEFINITION_FIELDS}"""
 CYPHER_DELTA_SITES = """MATCH (a)-[r:CALLS|REFERENCES|INSTANTIATES]->(b)
 WHERE a.qualified_name STARTS WITH $project_prefix

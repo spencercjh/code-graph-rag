@@ -839,6 +839,54 @@ def test_check_refuses_the_default_names_stamp_for_a_named_project(
     )
 
 
+def test_a_callee_lookup_does_not_reach_another_project() -> None:
+    """The by-qn definition lookup is scoped to the project asking.
+
+    `CYPHER_DELTA_SITES` prefix-scopes only the CALLER side, so a callee
+    name that no definition in the touched files resolves reaches the by-qn
+    lookup. In a shared graph holding several projects an identically named
+    definition from another project would otherwise answer it and supply
+    the parameter list the arity verdict is computed from.
+    """
+    from codebase_rag.structural_delta import snapshot
+
+    store = _StatefulIngestor()
+    store.ensure_node_batch(
+        cs.NodeLabel.FUNCTION.value,
+        {
+            cs.KEY_QUALIFIED_NAME: "proj.pkg.app.main",
+            cs.KEY_NAME: "main",
+            cs.KEY_PATH: "pkg/app.py",
+            cs.KEY_START_LINE: 1,
+        },
+    )
+    # Another project's symbol, outside the touched paths, so the only route
+    # to it is the by-qn lookup.
+    store.ensure_node_batch(
+        cs.NodeLabel.FUNCTION.value,
+        {
+            cs.KEY_QUALIFIED_NAME: "other.pkg.util.helper",
+            cs.KEY_NAME: "helper",
+            cs.KEY_PATH: "elsewhere/util.py",
+            cs.KEY_START_LINE: 1,
+            cs.KEY_POSITIONAL_PARAMS: ["a"],
+        },
+    )
+    store.ensure_relationship_batch(
+        (cs.NodeLabel.FUNCTION.value, cs.KEY_QUALIFIED_NAME, "proj.pkg.app.main"),
+        cs.RelationshipType.CALLS.value,
+        (cs.NodeLabel.FUNCTION.value, cs.KEY_QUALIFIED_NAME, "other.pkg.util.helper"),
+        {cs.KEY_LINE: 5, cs.KEY_COL: 1, cs.KEY_ARG_COUNT: 3},
+    )
+
+    taken = snapshot(store.fetch_all, "proj", ["pkg/app.py"])
+
+    # The call site is seen -- the lookup really is reached, so the empty
+    # `callees` below is a refusal rather than a walk that never happened.
+    assert [site.callee for site in taken.sites] == ["other.pkg.util.helper"]
+    assert taken.callees == {}
+
+
 def test_check_refuses_a_named_projects_stamp_for_the_default_project(
     temp_repo: Path,
 ) -> None:

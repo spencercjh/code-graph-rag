@@ -244,7 +244,10 @@ def snapshot(fetch_all: QueryFn, project_name: str, paths: Iterable[str]) -> Sna
     missing = sorted({s.callee for s in sites} - set(definitions))
     callees: dict[str, Definition] = {}
     if missing:
-        for row in fetch_all(cq.CYPHER_DELTA_DEFINITIONS_BY_QN, {cs.KEY_QNS: missing}):
+        for row in fetch_all(
+            cq.CYPHER_DELTA_DEFINITIONS_BY_QN,
+            {cs.KEY_QNS: missing, cs.KEY_PROJECT_PREFIX: _prefix(project_name)},
+        ):
             definition = _definition(row)
             if definition.qualified_name:
                 callees[definition.qualified_name] = definition
