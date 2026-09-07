@@ -920,7 +920,50 @@ def test_check_refuses_a_named_projects_stamp_for_the_default_project(
     with pytest.raises(CheckError):
         indexed_scope(root, own_name)
     # The project it belongs to still reads it.
-    assert indexed_scope(root, root.name) == (frozenset({"generated_src"}), None)
+    assert indexed_scope(root, root.name, explicit=True) == (
+        frozenset({"generated_src"}),
+        None,
+    )
+
+
+def test_check_refuses_an_unnamed_stamp_for_a_named_project(
+    temp_repo: Path,
+) -> None:
+    """An unnamed run overwrites the stamp; the named project's scope is gone.
+
+    The stamp is per repository, so a later `cgr index` with no --project
+    replaces whatever `cgr index --project myrepo` had written. Its owner
+    string is the directory name either way, so only the recorded
+    provenance separates them -- and once overwritten the named project's
+    scope is not recoverable, so the check must refuse rather than apply
+    the unnamed run's.
+    """
+    from codebase_rag.structural_check import CheckError, indexed_scope
+    from codebase_rag.utils.path_utils import derive_project_name
+
+    root = temp_repo / PROJECT
+    for rel, text in FIXTURE.items():
+        _write(root, rel, text)
+    parsers, queries = __import__(
+        "codebase_rag.parser_loader", fromlist=["load_parsers"]
+    ).load_parsers()
+    # The unnamed run, which owns the stamp on disk.
+    GraphUpdater(
+        ingestor=_StatefulIngestor(),
+        repo_path=root,
+        parsers=parsers,
+        queries=queries,
+        exclude_paths=frozenset({"generated_src"}),
+    ).run(force=True)
+    # `cgr check --project <basename>` is a different graph and must refuse.
+    with pytest.raises(CheckError):
+        indexed_scope(root, root.name, explicit=True)
+    # The unnamed default it belongs to still reads it -- so the refusal
+    # above is about provenance, not a stamp that cannot be read at all.
+    assert indexed_scope(root, derive_project_name(root)) == (
+        frozenset({"generated_src"}),
+        None,
+    )
 
 
 @pytest.mark.parametrize("base", ["HEAD~1..HEAD", "HEAD~1...HEAD", "no-such-rev"])
